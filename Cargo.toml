@@ -1,9 +1,11 @@
 [package]
 name = "ice-tool"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "CLI for managing cloud VM instances and marketplace offers."
 license = "AGPL-3.0-only"
+repository = "https://github.com/khoek/ice-tool"
+keywords = ["cli", "cloud", "vm", "aws", "gcp"]
 
 [[bin]]
 name = "ice"
