@@ -1,9 +1,13 @@
 [package]
-name = "ice"
+name = "ice-tool"
 version = "0.1.0"
 edition = "2024"
 description = "CLI for managing cloud VM instances and marketplace offers."
 license = "AGPL-3.0-only"
+
+[[bin]]
+name = "ice"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
