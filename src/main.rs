@@ -582,6 +582,9 @@ enum ConfigCommands {
 
     #[command(name = "set", about = "Set a single config key.")]
     Set(ConfigSetArgs),
+
+    #[command(name = "unset", about = "Unset a single config key.")]
+    Unset(ConfigUnsetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -597,6 +600,12 @@ struct ConfigGetArgs {
 struct ConfigSetArgs {
     /// Key/value pair in KEY=VALUE form.
     pair: String,
+}
+
+#[derive(Debug, Args)]
+struct ConfigUnsetArgs {
+    /// Config key to unset.
+    key: String,
 }
 
 #[derive(Debug, Args)]
@@ -1016,6 +1025,20 @@ struct VastInstance {
     ssh_port: Option<u16>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct VastScheduledJob {
+    #[serde(default)]
+    instance_id: Option<u64>,
+    #[serde(default)]
+    api_endpoint: Option<String>,
+    #[serde(default)]
+    request_method: Option<String>,
+    #[serde(default)]
+    request_body: Option<Value>,
+    #[serde(default)]
+    start_time: Option<f64>,
+}
+
 impl VastInstance {
     fn label_str(&self) -> &str {
         self.label.as_deref().unwrap_or("")
@@ -1207,6 +1230,25 @@ impl VastClient {
         let parsed: VastInstancesResponse =
             serde_json::from_value(value).context("Failed to parse vast.ai instances response")?;
         Ok(parsed.instances)
+    }
+
+    fn list_scheduled_jobs(&self) -> Result<Vec<VastScheduledJob>> {
+        let value = self.get_json("/api/v0/commands/schedule_job/", "list scheduled jobs")?;
+        let rows = if let Some(array) = value.as_array() {
+            array.clone()
+        } else if let Some(array) = value.get("results").and_then(Value::as_array) {
+            array.clone()
+        } else {
+            Vec::new()
+        };
+
+        let mut jobs = Vec::new();
+        for row in rows {
+            if let Ok(parsed) = serde_json::from_value::<VastScheduledJob>(row) {
+                jobs.push(parsed);
+            }
+        }
+        Ok(jobs)
     }
 
     fn get_instance(&self, id: u64) -> Result<Option<VastInstance>> {
@@ -1504,6 +1546,7 @@ fn cmd_config(args: ConfigArgs, config: &mut IceConfig) -> Result<()> {
         ConfigCommands::List(_args) => cmd_config_list(config),
         ConfigCommands::Get(get_args) => cmd_config_get(get_args, config),
         ConfigCommands::Set(set_args) => cmd_config_set(set_args, config),
+        ConfigCommands::Unset(unset_args) => cmd_config_unset(unset_args, config),
     }
 }
 
@@ -1530,6 +1573,14 @@ fn cmd_config_set(args: ConfigSetArgs, config: &mut IceConfig) -> Result<()> {
     Ok(())
 }
 
+fn cmd_config_unset(args: ConfigUnsetArgs, config: &mut IceConfig) -> Result<()> {
+    let key = normalize_config_key(&args.key)?;
+    unset_config_value(config, &key)?;
+    let path = save_config(config)?;
+    eprintln!("Unset `{key}` ({})", path.display());
+    Ok(())
+}
+
 fn cmd_list(args: CloudArgs, config: &IceConfig) -> Result<()> {
     let cloud = resolve_cloud(args.cloud, config)?;
     if cloud != Cloud::VastAi {
@@ -1544,6 +1595,13 @@ fn cmd_list(args: CloudArgs, config: &IceConfig) -> Result<()> {
                 .filter(|instance| instance.label_str().starts_with(ICE_LABEL_PREFIX))
                 .collect();
             persist_vast_instance_cache(&instances);
+            let scheduled_termination = match client.list_scheduled_jobs() {
+                Ok(jobs) => nearest_vast_scheduled_termination_by_instance(&jobs),
+                Err(err) => {
+                    eprintln!("Warning: failed to load Vast scheduled jobs: {err:#}");
+                    HashMap::new()
+                }
+            };
 
             instances.sort_by(|a, b| b.id.cmp(&a.id));
 
@@ -1561,7 +1619,10 @@ fn cmd_list(args: CloudArgs, config: &IceConfig) -> Result<()> {
                 let label = truncate_ellipsis(visible_instance_name(instance.label_str()), 28);
                 let state = truncate_ellipsis(instance.state_str(), 10);
                 let hours = format!("{:.2}", instance.runtime_hours());
-                let remaining = vast_remaining_hours_display(&instance);
+                let remaining = vast_remaining_hours_display(
+                    &instance,
+                    scheduled_termination.get(&instance.id).copied(),
+                );
                 let health = instance.health_hint();
                 let hourly = instance
                     .dph_total
@@ -3216,13 +3277,7 @@ fn open_ssh_shell(instance: &VastInstance, identity_file: Option<&Path>) -> Resu
     wait_for_ssh_port_preflight(instance.id, &host, port, Duration::from_secs(30))?;
 
     let mut command = Command::new("ssh");
-    command
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg(format!("root@{host}"));
-    maybe_add_ssh_identity_args(&mut command, identity_file);
+    command.args(vast_ssh_args(&host, port, identity_file));
 
     let status = command
         .status()
@@ -3262,14 +3317,21 @@ fn wait_for_ssh_port_preflight(
     }
 }
 
-fn maybe_add_ssh_identity_args(command: &mut Command, identity_file: Option<&Path>) {
+fn vast_ssh_args(host: &str, port: u16, identity_file: Option<&Path>) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_owned(),
+        port.to_string(),
+        "-o".to_owned(),
+        "StrictHostKeyChecking=accept-new".to_owned(),
+    ];
     if let Some(identity) = identity_file {
-        command
-            .arg("-i")
-            .arg(identity)
-            .arg("-o")
-            .arg("IdentitiesOnly=yes");
+        args.push("-i".to_owned());
+        args.push(identity.display().to_string());
+        args.push("-o".to_owned());
+        args.push("IdentitiesOnly=yes".to_owned());
     }
+    args.push(format!("root@{host}"));
+    args
 }
 
 fn open_vast_shell_with_auto_key(client: &VastClient, instance: &VastInstance) -> Result<()> {
@@ -3518,13 +3580,8 @@ fn run_remote_git_clone(
     let spinner = spinner("Running setup action: cloning repository...");
     let mut command = Command::new("ssh");
     command
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg(format!("root@{host}"))
+        .args(vast_ssh_args(&host, port, identity_file))
         .arg(command_str);
-    maybe_add_ssh_identity_args(&mut command, identity_file);
     let status = command
         .status()
         .context("Failed to run remote git clone command")?;
@@ -3580,22 +3637,107 @@ fn tcp_port_open(host: &str, port: u16, timeout: Duration) -> Result<()> {
     );
 }
 
-fn remaining_contract_hours(instance: &VastInstance) -> f64 {
+fn nearest_vast_scheduled_termination_by_instance(jobs: &[VastScheduledJob]) -> HashMap<u64, f64> {
     let now = now_unix_secs_f64();
-    let Some(end_date) = instance.end_date else {
-        return 0.0;
-    };
-    if end_date <= now {
-        return 0.0;
+    let mut nearest = HashMap::new();
+
+    for job in jobs {
+        let Some(instance_id) = job.instance_id else {
+            continue;
+        };
+        let Some(termination_unix) = vast_job_termination_unix(job) else {
+            continue;
+        };
+        if termination_unix <= now {
+            continue;
+        }
+        nearest
+            .entry(instance_id)
+            .and_modify(|existing: &mut f64| *existing = existing.min(termination_unix))
+            .or_insert(termination_unix);
     }
-    (end_date - now) / 3600.0
+
+    nearest
 }
 
-fn vast_remaining_hours_display(instance: &VastInstance) -> String {
-    if instance.end_date.is_none() {
+fn vast_job_termination_unix(job: &VastScheduledJob) -> Option<f64> {
+    let Some(start_time) = job.start_time else {
+        return None;
+    };
+    let endpoint = job.api_endpoint.as_deref().unwrap_or("");
+    if !endpoint.contains("/api/v0/instances/") {
+        return None;
+    }
+
+    let method = job
+        .request_method
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    if method == "DELETE" {
+        return Some(start_time);
+    }
+    if method == "PUT" {
+        let Some(body) = job.request_body.as_ref() else {
+            return None;
+        };
+        let state = body
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if state == "stopped" || state == "deleted" {
+            return Some(start_time);
+        }
+    }
+    None
+}
+
+fn remaining_contract_hours_at(
+    instance: &VastInstance,
+    scheduled_termination_unix: Option<f64>,
+    now: f64,
+) -> f64 {
+    let contract_remaining = instance.end_date.and_then(|end_date| {
+        if end_date > now {
+            Some((end_date - now) / 3600.0)
+        } else {
+            None
+        }
+    });
+    let scheduled_remaining = scheduled_termination_unix.and_then(|time| {
+        if time > now {
+            Some((time - now) / 3600.0)
+        } else {
+            None
+        }
+    });
+
+    match (contract_remaining, scheduled_remaining) {
+        (Some(contract), Some(scheduled)) => contract.min(scheduled),
+        (Some(contract), None) => contract,
+        (None, Some(scheduled)) => scheduled,
+        (None, None) => 0.0,
+    }
+}
+
+fn remaining_contract_hours(
+    instance: &VastInstance,
+    scheduled_termination_unix: Option<f64>,
+) -> f64 {
+    remaining_contract_hours_at(instance, scheduled_termination_unix, now_unix_secs_f64())
+}
+
+fn vast_remaining_hours_display(
+    instance: &VastInstance,
+    scheduled_termination_unix: Option<f64>,
+) -> String {
+    if instance.end_date.is_none() && scheduled_termination_unix.is_none() {
         return "-".to_owned();
     }
-    let remaining = remaining_contract_hours(instance).max(0.0);
+    let remaining = remaining_contract_hours(instance, scheduled_termination_unix).max(0.0);
     format!("{remaining:.2}h")
 }
 
@@ -4460,6 +4602,47 @@ fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -> Result<St
         }
         _ => unreachable!(),
     }
+}
+
+fn unset_config_value(config: &mut IceConfig, key: &str) -> Result<()> {
+    let key = normalize_config_key(key)?;
+    match key.as_str() {
+        "default.cloud" => config.default.cloud = None,
+        "default.vast_ai.min_cpus" => config.default.vast_ai.min_cpus = None,
+        "default.vast_ai.min_ram_gb" => config.default.vast_ai.min_ram_gb = None,
+        "default.vast_ai.allowed_gpus" => config.default.vast_ai.allowed_gpus = None,
+        "default.vast_ai.max_price_per_hr" => config.default.vast_ai.max_price_per_hr = None,
+        "default.gcp.min_cpus" => config.default.gcp.min_cpus = None,
+        "default.gcp.min_ram_gb" => config.default.gcp.min_ram_gb = None,
+        "default.gcp.allowed_gpus" => config.default.gcp.allowed_gpus = None,
+        "default.gcp.max_price_per_hr" => config.default.gcp.max_price_per_hr = None,
+        "default.aws.min_cpus" => config.default.aws.min_cpus = None,
+        "default.aws.min_ram_gb" => config.default.aws.min_ram_gb = None,
+        "default.aws.allowed_gpus" => config.default.aws.allowed_gpus = None,
+        "default.aws.max_price_per_hr" => config.default.aws.max_price_per_hr = None,
+        "default.setup.action" => config.default.setup.action = None,
+        "default.setup.repo_url" => config.default.setup.repo_url = None,
+        "default.gcp.region" => config.default.gcp.region = None,
+        "default.gcp.zone" => config.default.gcp.zone = None,
+        "default.gcp.image_family" => config.default.gcp.image_family = None,
+        "default.gcp.image_project" => config.default.gcp.image_project = None,
+        "default.gcp.boot_disk_gb" => config.default.gcp.boot_disk_gb = None,
+        "default.aws.region" => config.default.aws.region = None,
+        "default.aws.ami" => config.default.aws.ami = None,
+        "default.aws.key_name" => config.default.aws.key_name = None,
+        "default.aws.ssh_key_path" => config.default.aws.ssh_key_path = None,
+        "default.aws.ssh_user" => config.default.aws.ssh_user = None,
+        "default.aws.security_group_id" => config.default.aws.security_group_id = None,
+        "default.aws.subnet_id" => config.default.aws.subnet_id = None,
+        "default.aws.root_disk_gb" => config.default.aws.root_disk_gb = None,
+        "auth.vast_ai.api_key" => config.auth.vast_ai.api_key = None,
+        "auth.gcp.project" => config.auth.gcp.project = None,
+        "auth.gcp.service_account_json" => config.auth.gcp.service_account_json = None,
+        "auth.aws.access_key_id" => config.auth.aws.access_key_id = None,
+        "auth.aws.secret_access_key" => config.auth.aws.secret_access_key = None,
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 fn parse_cloud(value: &str) -> Result<Cloud> {
@@ -6715,6 +6898,25 @@ fn print_big_red_error(message: &str) {
 mod tests {
     use super::*;
 
+    fn test_vast_instance(end_date: Option<f64>) -> VastInstance {
+        VastInstance {
+            id: 42,
+            label: Some("ice-test".to_owned()),
+            cur_state: Some("running".to_owned()),
+            next_state: None,
+            intended_status: None,
+            actual_status: None,
+            status_msg: None,
+            start_date: None,
+            uptime_mins: None,
+            gpu_name: None,
+            dph_total: None,
+            end_date,
+            ssh_host: None,
+            ssh_port: None,
+        }
+    }
+
     #[test]
     fn gpu_fp32_ordering_sanity() {
         assert!(gpu_quality_score("Tesla T4") < gpu_quality_score("L4"));
@@ -6808,5 +7010,148 @@ mod tests {
         let expected_billed = required_runtime_seconds(requested) as f64 / 3600.0;
         assert!((cost.billed_hours - expected_billed).abs() < 1e-9);
         assert!(cost.billed_hours >= requested);
+    }
+
+    #[test]
+    fn vast_ssh_args_place_identity_options_before_destination() {
+        let args = vast_ssh_args("ssh1.vast.ai", 10135, Some(Path::new("/tmp/id_ed25519")));
+        let host_index = args
+            .iter()
+            .position(|value| value == "root@ssh1.vast.ai")
+            .expect("host arg");
+        let identity_index = args
+            .iter()
+            .position(|value| value == "-i")
+            .expect("identity flag");
+        assert!(identity_index < host_index);
+        assert!(args.iter().any(|value| value == "IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn vast_ssh_args_without_identity_keep_destination_last() {
+        let args = vast_ssh_args("ssh1.vast.ai", 10135, None);
+        assert_eq!(
+            args.last().expect("destination argument"),
+            "root@ssh1.vast.ai"
+        );
+        assert!(!args.iter().any(|value| value == "-i"));
+        assert!(!args.iter().any(|value| value == "IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
+        let stop_job = VastScheduledJob {
+            instance_id: Some(42),
+            api_endpoint: Some("/api/v0/instances/42/".to_owned()),
+            request_method: Some("PUT".to_owned()),
+            request_body: Some(json!({"state":"stopped"})),
+            start_time: Some(1_700_000_000.0),
+        };
+        let delete_job = VastScheduledJob {
+            instance_id: Some(42),
+            api_endpoint: Some("/api/v0/instances/42/".to_owned()),
+            request_method: Some("DELETE".to_owned()),
+            request_body: None,
+            start_time: Some(1_700_000_100.0),
+        };
+        let irrelevant_job = VastScheduledJob {
+            instance_id: Some(42),
+            api_endpoint: Some("/api/v0/instances/42/".to_owned()),
+            request_method: Some("PUT".to_owned()),
+            request_body: Some(json!({"state":"running"})),
+            start_time: Some(1_700_000_200.0),
+        };
+
+        assert_eq!(vast_job_termination_unix(&stop_job), Some(1_700_000_000.0));
+        assert_eq!(
+            vast_job_termination_unix(&delete_job),
+            Some(1_700_000_100.0)
+        );
+        assert_eq!(vast_job_termination_unix(&irrelevant_job), None);
+    }
+
+    #[test]
+    fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
+        let now = now_unix_secs_f64();
+        let jobs = vec![
+            VastScheduledJob {
+                instance_id: Some(42),
+                api_endpoint: Some("/api/v0/instances/42/".to_owned()),
+                request_method: Some("PUT".to_owned()),
+                request_body: Some(json!({"state":"stopped"})),
+                start_time: Some(now + 7_200.0),
+            },
+            VastScheduledJob {
+                instance_id: Some(42),
+                api_endpoint: Some("/api/v0/instances/42/".to_owned()),
+                request_method: Some("DELETE".to_owned()),
+                request_body: None,
+                start_time: Some(now + 3_600.0),
+            },
+            VastScheduledJob {
+                instance_id: Some(42),
+                api_endpoint: Some("/api/v0/instances/42/".to_owned()),
+                request_method: Some("DELETE".to_owned()),
+                request_body: None,
+                start_time: Some(now - 60.0),
+            },
+        ];
+
+        let nearest = nearest_vast_scheduled_termination_by_instance(&jobs);
+        let value = nearest.get(&42).copied().expect("nearest time");
+        assert!(value >= now + 3_599.0);
+        assert!(value <= now + 3_601.0);
+    }
+
+    #[test]
+    fn remaining_contract_hours_at_prefers_scheduled_termination_when_sooner() {
+        let now = 1_700_000_000.0;
+        let instance = test_vast_instance(Some(now + 10.0 * 3600.0));
+        let remaining = remaining_contract_hours_at(&instance, Some(now + 2.0 * 3600.0), now);
+        assert!((remaining - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn remaining_contract_hours_at_uses_scheduled_when_no_contract_end() {
+        let now = 1_700_000_000.0;
+        let instance = test_vast_instance(None);
+        let remaining = remaining_contract_hours_at(&instance, Some(now + 1.5 * 3600.0), now);
+        assert!((remaining - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unset_config_value_clears_values() {
+        let mut config = IceConfig::default();
+        set_config_value(&mut config, "default.cloud", "aws").expect("set cloud");
+        set_config_value(&mut config, "default.aws.region", "us-west-2").expect("set region");
+        set_config_value(&mut config, "auth.aws.access_key_id", "AKIA_TEST").expect("set key");
+
+        unset_config_value(&mut config, "default.cloud").expect("unset cloud");
+        unset_config_value(&mut config, "default.aws.region").expect("unset region");
+        unset_config_value(&mut config, "auth.aws.access_key_id").expect("unset key");
+
+        assert_eq!(
+            get_config_value(&config, "default.cloud").expect("cloud"),
+            "<unset>"
+        );
+        assert_eq!(
+            get_config_value(&config, "default.aws.region").expect("region"),
+            "<unset>"
+        );
+        assert_eq!(
+            get_config_value(&config, "auth.aws.access_key_id").expect("access key"),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    fn unset_config_value_accepts_legacy_alias_keys() {
+        let mut config = IceConfig::default();
+        set_config_value(&mut config, "default.vast_ai.min_cpus", "4").expect("set min_cpus");
+        unset_config_value(&mut config, "default.min_cpus").expect("unset min_cpus alias");
+        assert_eq!(
+            get_config_value(&config, "default.vast_ai.min_cpus").expect("min_cpus"),
+            "<unset>"
+        );
     }
 }

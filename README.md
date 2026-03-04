@@ -34,6 +34,7 @@ Supported cloud identifiers:
 - `ice config list`
 - `ice config get <KEY>`
 - `ice config set <KEY=VALUE>`
+- `ice config unset <KEY>`
 - `ice list [--cloud CLOUD]`
 - `ice shell|sh [--cloud CLOUD] <INSTANCE>`
 - `ice dl [--cloud CLOUD] <INSTANCE> <REMOTE_PATH> [LOCAL_PATH]`
@@ -53,6 +54,7 @@ Use:
 - `ice config list` to view supported keys and current values
 - `ice config get <KEY>` to read one key
 - `ice config set <KEY=VALUE>` to write one key
+- `ice config unset <KEY>` to clear one key
 
 Auth values are redacted in config output.
 
